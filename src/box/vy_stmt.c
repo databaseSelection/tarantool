@@ -152,38 +152,28 @@ vy_stmt_new_select(struct tuple_format *format, const char *key,
 	return vy_stmt_new_key(format, key, part_count, IPROTO_SELECT);
 }
 
-struct tuple *
-vy_stmt_new_delete(struct tuple_format *format, const char *key,
-		   uint32_t part_count)
-{
-	return vy_stmt_new_key(format, key, part_count, IPROTO_DELETE);
-}
-
 /**
  * Create a statement without type and with reserved space for operations.
  * Operations can be saved in the space available by @param extra.
  * For details @sa struct vy_stmt comment.
  */
 struct tuple *
-vy_stmt_new_with_ops(const char *tuple_begin, const char *tuple_end,
-		     enum iproto_type type, struct tuple_format *format,
-		     uint32_t part_count,
-		     struct iovec *operations, uint32_t iovcnt)
+vy_stmt_new_upsert(const char *tuple_begin, const char *tuple_end,
+		   struct tuple_format *format, uint32_t part_count,
+		   struct iovec *operations, uint32_t ops_cnt)
 {
 	(void) part_count; /* unused in release. */
 #ifndef NDEBUG
 	const char *tuple_end_must_be = tuple_begin;
 	mp_next(&tuple_end_must_be);
 	assert(tuple_end == tuple_end_must_be);
-#endif
-
-	uint32_t field_count = mp_decode_array(&tuple_begin);
+	tuple_end_must_be = tuple_begin;
+	uint32_t field_count = mp_decode_array(&tuple_end_must_be);
 	assert(field_count >= part_count);
-
-	uint32_t extra_size = 0;
-	for (uint32_t i = 0; i < iovcnt; ++i) {
-		extra_size += operations[i].iov_len;
-	}
+#endif
+	uint32_t ops_size = 0;
+	for (uint32_t i = 0; i < ops_cnt; ++i)
+		ops_size += operations[i].iov_len;
 
 	/*
 	 * Allocate stmt. Offsets: one per key part + offset of the
@@ -191,27 +181,25 @@ vy_stmt_new_with_ops(const char *tuple_begin, const char *tuple_end,
 	 */
 	uint32_t offsets_size = format->field_map_size;
 	uint32_t bsize = tuple_end - tuple_begin;
-	uint32_t size = offsets_size + mp_sizeof_array(field_count) +
-			bsize + extra_size;
+	uint32_t size = offsets_size + bsize + ops_size;
 	struct tuple *stmt = vy_stmt_alloc(format, size);
 	if (stmt == NULL)
 		return NULL;
-	stmt->bsize = bsize +  mp_sizeof_array(field_count);
+	stmt->bsize = bsize + ops_size;
 	/* Copy MsgPack data */
 	stmt->data_offset = offsets_size + sizeof(struct vy_stmt);
 	char *raw = (char *) stmt + stmt->data_offset;
-	char *wpos = mp_encode_array(raw, field_count);
+	char *wpos = raw;
 	memcpy(wpos, tuple_begin, bsize);
 	wpos += bsize;
-	assert(wpos == raw + stmt->bsize);
-	for (struct iovec *op = operations, *end = operations + iovcnt;
+	assert(wpos == raw + bsize);
+	for (struct iovec *op = operations, *end = operations + ops_cnt;
 	     op != end; ++op) {
 
 		memcpy(wpos, op->iov_base, op->iov_len);
 		wpos += op->iov_len;
 	}
-	stmt->bsize += extra_size;
-	vy_stmt_set_type(stmt, type);
+	vy_stmt_set_type(stmt, IPROTO_UPSERT);
 
 	/* Calculate offsets for key parts */
 	if (tuple_init_field_map(format, (uint32_t *) raw, raw)) {
@@ -222,20 +210,34 @@ vy_stmt_new_with_ops(const char *tuple_begin, const char *tuple_end,
 }
 
 struct tuple *
-vy_stmt_new_upsert(const char *tuple_begin, const char *tuple_end,
-		   struct tuple_format *format, uint32_t part_count,
-		   struct iovec *operations, uint32_t ops_cnt)
+vy_new_tuple(struct tuple_format *format, const char *tuple,
+	     const char *tuple_end, enum iproto_type type)
 {
-	return vy_stmt_new_with_ops(tuple_begin, tuple_end, IPROTO_UPSERT,
-				    format, part_count, operations, ops_cnt);
-}
+	/*
+	 * Allocate stmt. Offsets: one per key part + offset of the
+	 * statement end.
+	 */
+	uint32_t offsets_size = format->field_map_size;
+	uint32_t bsize = tuple_end - tuple;
+	uint32_t size = offsets_size +  bsize;
+	struct tuple *stmt = vy_stmt_alloc(format, size);
+	if (stmt == NULL)
+		return NULL;
+	stmt->bsize = bsize;
+	/* Copy MsgPack data */
+	stmt->data_offset = offsets_size + sizeof(struct vy_stmt);
+	char *raw = (char *) stmt + stmt->data_offset;
+	char *wpos = raw;
+	memcpy(wpos, tuple, bsize);
+	wpos += bsize;
+	vy_stmt_set_type(stmt, type);
 
-struct tuple *
-vy_stmt_new_replace(const char *tuple_begin, const char *tuple_end,
-		    struct tuple_format *format, uint32_t part_count)
-{
-	return vy_stmt_new_with_ops(tuple_begin, tuple_end, IPROTO_REPLACE,
-				    format, part_count, NULL, 0);
+	/* Calculate offsets for key parts */
+	if (tuple_init_field_map(format, (uint32_t *) raw, raw)) {
+		tuple_unref(stmt);
+		return NULL;
+	}
+	return stmt;
 }
 
 struct tuple *
@@ -342,19 +344,22 @@ vy_stmt_decode(struct xrow_header *xrow, struct tuple_format *format,
 			   xrow->body->iov_len) < 0)
 		return NULL;
 	struct tuple *stmt = NULL;
-	uint32_t field_count;
+	const char *key;
+	(void) key;
 	struct iovec ops;
 	switch (request.type) {
 	case IPROTO_DELETE:
 		/* extract key */
-		field_count = mp_decode_array(&request.key);
-		assert(field_count == part_count);
-		stmt = vy_stmt_new_delete(format, request.key, field_count);
+#ifndef NDEBUG
+		key = request.key;
+		assert(mp_decode_array(&key) == part_count);
+#endif
+		stmt = vy_new_tuple(format, request.key, request.key_end,
+				    IPROTO_DELETE);
 		break;
 	case IPROTO_REPLACE:
-		stmt = vy_stmt_new_replace(request.tuple,
-					   request.tuple_end,
-					   format, part_count);
+		stmt = vy_new_tuple(format, request.tuple, request.tuple_end,
+				    IPROTO_REPLACE);
 		break;
 	case IPROTO_UPSERT:
 		ops.iov_base = (char *)request.ops;

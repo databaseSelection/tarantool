@@ -5196,7 +5196,8 @@ vy_index_new(struct vy_env *e, struct key_def *user_key_def,
 
 	struct tuple_format *format =
 		tuple_format_new(&key_list, &vy_tuple_format_vtab);
-	assert(format != NULL);
+	if (format == NULL)
+		goto fail_format;
 	tuple_format_ref(format, 1);
 
 	struct vy_index *index = calloc(1, sizeof(struct vy_index));
@@ -5257,6 +5258,7 @@ fail_conf:
 	free(index);
 fail_index:
 	tuple_format_ref(format, -1);
+fail_format:
 	if (key_def->iid > 0)
 		key_def_delete(key_def_secondary_to_primary);
 fail_key_def_secondary_to_primary:
@@ -5446,8 +5448,8 @@ vy_apply_upsert(const struct tuple *new_stmt, const struct tuple *old_stmt,
 		/*
 		 * UPDATE case: return the updated old stmt.
 		 */
-		result_stmt = vy_stmt_new_replace(result_mp, result_mp_end,
-						  format, key_def->part_count);
+		result_stmt = vy_new_tuple(format, result_mp, result_mp_end,
+					   IPROTO_REPLACE);
 		region_truncate(region, region_svp);
 		if (result_stmt == NULL)
 			return NULL; /* OOM */
@@ -5703,6 +5705,46 @@ vy_insert_primary(struct vy_tx *tx, struct vy_index *pk, struct tuple *stmt)
 	return vy_tx_set(tx, pk, stmt);
 }
 
+struct tuple *
+vy_stmt_convert_for_index(const struct tuple *original, struct vy_index *index)
+{
+	struct key_def *def = index->key_def_tuple_to_key;
+	struct tuple_format *format = index->format;
+	struct region *region = &fiber()->gc;
+	size_t used = region_used(region);
+	uint32_t key_len;
+	const char *key = tuple_extract_key(original, def, &key_len);
+	if (key == NULL)
+		return NULL;
+	uint32_t part_count = mp_decode_array(&key);
+	key_len -= mp_sizeof_array(part_count);
+	uint32_t nulls_count = format->field_count - def->part_count;
+	part_count += nulls_count;
+	uint32_t mp_size = key_len + nulls_count * mp_sizeof_nil() +
+			   mp_sizeof_array(part_count);
+	char *raw_res = region_alloc(region, mp_size + sizeof(struct vy_stmt));
+	if (raw_res == NULL) {
+		region_truncate(region, used);
+		return NULL;
+	}
+	char *tuple_pos = mp_encode_array(raw_res, part_count);
+	for (uint32_t i = 0; i < format->field_count; ++i) {
+		struct tuple_field_format *field = &format->fields[i];
+		if (field->type == FIELD_TYPE_ANY) {
+			tuple_pos = mp_encode_nil(tuple_pos);
+			continue;
+		}
+		const char *begin = key;
+		mp_next(&key);
+		memcpy(tuple_pos, begin, key - begin);
+		tuple_pos += key - begin;
+	}
+	struct tuple *res = vy_new_tuple(format, raw_res, tuple_pos,
+					 vy_stmt_type(original));
+	region_truncate(region, used);
+	return res;
+}
+
 /**
  * Insert a tuple in a secondary index.
  * @param tx        Current transaction.
@@ -5737,8 +5779,8 @@ vy_insert_secondary(struct vy_tx *tx, struct vy_index *index,
 		if (vy_check_dup_key(tx, index, check_key, part_count))
 			return -1;
 	}
-	struct tuple *tuple = vy_stmt_new_replace(key, key_end, index->format,
-						  def->part_count);
+	struct tuple *tuple = vy_new_tuple(index->format, key, key_end,
+					   IPROTO_REPLACE);
 	if (tuple == NULL)
 		return -1;
 	int rc = vy_tx_set(tx, index, tuple);
@@ -5771,8 +5813,8 @@ vy_replace_one(struct vy_tx *tx, struct space *space,
 	struct key_def *def = pk->key_def;
 	assert(def->iid == 0);
 	struct tuple *new_tuple =
-		vy_stmt_new_replace(request->tuple, request->tuple_end,
-				    space->format, def->part_count);
+		vy_new_tuple(space->format, request->tuple, request->tuple_end,
+			     IPROTO_REPLACE);
 	if (new_tuple == NULL)
 		return -1;
 	/**
@@ -5814,15 +5856,16 @@ vy_replace_one(struct vy_tx *tx, struct space *space,
  */
 int
 vy_index_delete_key(struct vy_tx *tx, struct vy_index *index,
-		    const char *key, uint32_t part_count)
+		    const char *key, const char *key_end)
 {
 	assert(tx == NULL || tx->state == VINYL_TX_READY);
-	assert(part_count <= index->key_def->part_count);
+	const char *tmp = key;
+	(void) tmp;
+	assert(mp_decode_array(&tmp) <= index->key_def->part_count);
 	struct tuple *vykey;
-	vykey = vy_stmt_new_delete(index->space->format, key, part_count);
+	vykey = vy_new_tuple(index->format, key, key_end, IPROTO_DELETE);
 	if (vykey == NULL)
 		return -1;
-	assert(vy_stmt_type(vykey) == IPROTO_DELETE);
 	int rc = vy_tx_set(tx, index, vykey);
 	tuple_unref(vykey);
 	return rc;
@@ -5855,8 +5898,8 @@ vy_replace_impl(struct vy_tx *tx, struct space *space, struct request *request,
 		return -1;
 	struct key_def *def = pk->key_def;
 	assert(def->iid == 0);
-	new_stmt = vy_stmt_new_replace(request->tuple, request->tuple_end,
-				       space->format, def->part_count);
+	new_stmt = vy_new_tuple(space->format, request->tuple,
+				request->tuple_end, IPROTO_REPLACE);
 	if (new_stmt == NULL)
 		return -1;
 	const char *key = tuple_extract_key(new_stmt, def, NULL);
@@ -5884,14 +5927,14 @@ vy_replace_impl(struct vy_tx *tx, struct space *space, struct request *request,
 		 * transaction index.
 		 */
 		if (old_stmt != NULL) {
+			uint32_t key_size;
 			key = tuple_extract_key(old_stmt,
 						index->key_def_tuple_to_key,
-						NULL);
+						&key_size);
 			if (key == NULL)
 				goto error;
-			part_count = mp_decode_array(&key);
 			if (vy_index_delete_key(tx, index, key,
-						part_count) != 0)
+						key + key_size) != 0)
 				goto error;
 		}
 		if (vy_insert_secondary(tx, index, new_stmt) != 0)
@@ -6033,24 +6076,24 @@ vy_index_full_by_key(struct vy_tx *tx, struct vy_index *index, const char *key,
  */
 static inline int
 vy_delete_impl(struct vy_tx *tx, struct space *space, const struct tuple *tuple,
-	       const char *key, uint32_t part_count)
+	       const char *key, const char *key_end)
 {
 	struct vy_index *pk = vy_index_find(space, 0);
 	if (pk == NULL)
 		return -1;
-	if (vy_index_delete_key(tx, pk, key, part_count))
+	if (vy_index_delete_key(tx, pk, key, key_end) != 0)
 		return -1;
 
 	/* At second, delete from seconary indexes. */
 	struct vy_index *index;
 	for (uint32_t i = 1; i < space->index_count; ++i) {
 		index = vy_index(space->index[i]);
+		uint32_t key_size;
 		key = tuple_extract_key(tuple, index->key_def_tuple_to_key,
-					NULL);
+					&key_size);
 		if (key == NULL)
 			return -1;
-		part_count = mp_decode_array(&key);
-		if (vy_index_delete_key(tx, index, key, part_count))
+		if (vy_index_delete_key(tx, index, key, key + key_size) != 0)
 			return -1;
 	}
 	return 0;
@@ -6088,6 +6131,8 @@ vy_delete(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 		if (stmt->old_tuple == NULL)
 			return 0;
 	}
+	key = request->key;
+	const char *key_end = request->key_end;
 	if (has_secondary) {
 		assert(stmt->old_tuple != NULL);
 		/*
@@ -6103,17 +6148,18 @@ vy_delete(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 			 * else the primary key already is
 			 * passed as parameter.
 			 */
+			uint32_t key_size;
 			key = tuple_extract_key(stmt->old_tuple, pk->key_def,
-						NULL);
+						&key_size);
 			if (key == NULL)
 				return -1;
-			part_count = mp_decode_array(&key);
+			key_end = key + key_size;
 		}
-		if (vy_delete_impl(tx, space, stmt->old_tuple, key, part_count))
+		if (vy_delete_impl(tx, space, stmt->old_tuple, key, key_end))
 			return -1;
 	} else { /* Primary is the single index in the space. */
 		assert(index->key_def->iid == 0);
-		if (vy_index_delete_key(tx, pk, key, part_count))
+		if (vy_index_delete_key(tx, pk, key, key_end))
 			return -1;
 	}
 	return 0;
@@ -6212,9 +6258,8 @@ vy_update(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	 */
 	if (tuple_validate_raw(space->format, new_tuple))
 		return -1;
-	stmt->new_tuple =
-		vy_stmt_new_replace(new_tuple, new_tuple_end, space->format,
-				    pk->key_def->part_count);
+	stmt->new_tuple = vy_new_tuple(space->format, new_tuple, new_tuple_end,
+				       IPROTO_REPLACE);
 	if (stmt->new_tuple == NULL)
 		return -1;
 	if (vy_check_update(pk, stmt->old_tuple, stmt->new_tuple))
@@ -6231,12 +6276,12 @@ vy_update(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 		index = vy_index(space->index[i]);
 		if (vy_can_skip_update(index, column_mask))
 			continue;
+		uint32_t key_size;
 		key = tuple_extract_key(stmt->old_tuple,
-					index->key_def_tuple_to_key, NULL);
+					index->key_def_tuple_to_key, &key_size);
 		if (key == NULL)
 			return -1;
-		part_count = mp_decode_array(&key);
-		if (vy_index_delete_key(tx, index, key, part_count))
+		if (vy_index_delete_key(tx, index, key, key + key_size) != 0)
 			return -1;
 		if (vy_insert_secondary(tx, index, stmt->new_tuple))
 			return -1;
@@ -6364,9 +6409,8 @@ vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	 * turns into INSERT.
 	 */
 	if (old_stmt == NULL) {
-		stmt->new_tuple =
-			vy_stmt_new_replace(tuple, tuple_end, space->format,
-					    pk_def->part_count);
+		stmt->new_tuple = vy_new_tuple(space->format, tuple, tuple_end,
+					       IPROTO_REPLACE);
 		if (stmt->new_tuple == NULL)
 			return -1;
 		return vy_insert_first_upsert(tx, space, stmt->new_tuple);
@@ -6392,9 +6436,8 @@ vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 		return -1;
 	new_tuple_end = new_tuple + new_size;
 	stmt->old_tuple = old_stmt;
-	stmt->new_tuple =
-		vy_stmt_new_replace(new_tuple, new_tuple_end, space->format,
-				    pk->key_def->part_count);
+	stmt->new_tuple = vy_new_tuple(space->format, new_tuple, new_tuple_end,
+				       IPROTO_REPLACE);
 	if (stmt->new_tuple == NULL)
 		return -1;
 
@@ -6414,13 +6457,13 @@ vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 		index = vy_index(space->index[i]);
 		if (vy_can_skip_update(index, column_mask))
 			continue;
+		uint32_t key_size;
 		key = tuple_extract_key_raw(old_tuple, old_tuple_end,
 					    index->key_def_tuple_to_key,
-					    NULL);
+					    &key_size);
 		if (key == NULL)
 			return -1;
-		part_count = mp_decode_array(&key);
-		if (vy_index_delete_key(tx, index, key, part_count) != 0)
+		if (vy_index_delete_key(tx, index, key, key + key_size) != 0)
 			return -1;
 		if (vy_insert_secondary(tx, index, stmt->new_tuple) != 0)
 			return -1;
@@ -6453,9 +6496,8 @@ vy_insert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	struct key_def *def = pk->key_def;
 	assert(def->iid == 0);
 	/* First insert into the primary index. */
-	stmt->new_tuple =
-		vy_stmt_new_replace(request->tuple, request->tuple_end,
-				    space->format, def->part_count);
+	stmt->new_tuple = vy_new_tuple(space->format, request->tuple,
+				       request->tuple_end, IPROTO_REPLACE);
 	if (stmt->new_tuple == NULL)
 		return -1;
 	if (vy_insert_primary(tx, pk, stmt->new_tuple) != 0)

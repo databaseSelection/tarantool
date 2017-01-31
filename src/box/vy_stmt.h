@@ -285,35 +285,9 @@ struct tuple *
 vy_stmt_new_select(struct tuple_format *format, const char *key,
 		   uint32_t part_count);
 
-/**
- * Create the DELETE statement from raw MessagePack data.
- * @param format     Format of an index.
- * @param key        MessagePack data that contain an array of
- *                   fields WITHOUT the array header.
- * @param part_count Count of the key fields that will be saved as
- *                   result.
- *
- * @retval NULL     Memory allocation error.
- * @retval not NULL Success.
- */
 struct tuple *
-vy_stmt_new_delete(struct tuple_format *format, const char *key,
-		   uint32_t part_count);
-
-/**
- * Create the REPLACE statement from raw MessagePack data.
- * @param tuple_begin MessagePack data that contain an array of fields WITH the
- *                    array header.
- * @param tuple_end End of the array that begins from @param tuple_begin.
- * @param format Format of a tuple for offsets generating.
- * @param part_count Part count from key definition.
- *
- * @retval NULL     Memory allocation error.
- * @retval not NULL Success.
- */
-struct tuple *
-vy_stmt_new_replace(const char *tuple_begin, const char *tuple_end,
-		    struct tuple_format *format, uint32_t part_count);
+vy_new_tuple(struct tuple_format *format, const char *tuple,
+	     const char *tuple_end, enum iproto_type type);
 
  /**
  * Create the UPSERT statement from raw MessagePack data.

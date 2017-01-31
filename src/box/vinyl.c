@@ -3282,7 +3282,7 @@ vy_range_set(struct vy_range *range, const struct tuple *stmt,
 
 	bool was_empty = (mem->used == 0);
 
-	int rc = vy_mem_insert(mem, stmt, alloc_lsn);
+	int rc = vy_mem_insert(mem, index->format, stmt, alloc_lsn);
 	if (rc != 0)
 		return -1;
 
@@ -3354,8 +3354,8 @@ vy_range_set_upsert(struct vy_range *range, struct tuple *stmt)
 		 */
 		assert(older == NULL || vy_stmt_type(older) != IPROTO_UPSERT);
 		struct tuple *upserted =
-			vy_apply_upsert(stmt, older, key_def, index->format,
-					false);
+			vy_apply_upsert(stmt, older, key_def,
+					index->space->format, false);
 		if (upserted == NULL)
 			return -1; /* OOM */
 		int64_t upserted_lsn = vy_stmt_lsn(upserted);
@@ -5557,9 +5557,8 @@ vy_tx_set(struct vy_tx *tx, struct vy_index *index, struct tuple *stmt)
 			       old_type == IPROTO_DELETE);
 			(void) old_type;
 
-			stmt = vy_apply_upsert(stmt, old->stmt,
-					       index->key_def, index->format,
-					       true);
+			stmt = vy_apply_upsert(stmt, old->stmt, index->key_def,
+					       index->space->format, true);
 			if (stmt == NULL)
 				return -1;
 			assert(vy_stmt_type(stmt) != 0);
@@ -5607,7 +5606,7 @@ vy_index_get(struct vy_tx *tx, struct vy_index *index, const char *key,
 	assert(tx == NULL || tx->state == VINYL_TX_READY);
 	struct tuple *vykey;
 	assert(part_count <= index->key_def->part_count);
-	vykey = vy_stmt_new_select(index->format, key, part_count);
+	vykey = vy_stmt_new_select(index->space->format, key, part_count);
 	if (vykey == NULL)
 		return -1;
 	struct vy_env *e = index->env;
@@ -5773,7 +5772,7 @@ vy_replace_one(struct vy_tx *tx, struct space *space,
 	assert(def->iid == 0);
 	struct tuple *new_tuple =
 		vy_stmt_new_replace(request->tuple, request->tuple_end,
-				    pk->format, def->part_count);
+				    space->format, def->part_count);
 	if (new_tuple == NULL)
 		return -1;
 	/**
@@ -5820,7 +5819,7 @@ vy_index_delete_key(struct vy_tx *tx, struct vy_index *index,
 	assert(tx == NULL || tx->state == VINYL_TX_READY);
 	assert(part_count <= index->key_def->part_count);
 	struct tuple *vykey;
-	vykey = vy_stmt_new_delete(index->format, key, part_count);
+	vykey = vy_stmt_new_delete(index->space->format, key, part_count);
 	if (vykey == NULL)
 		return -1;
 	assert(vy_stmt_type(vykey) == IPROTO_DELETE);
@@ -5857,7 +5856,7 @@ vy_replace_impl(struct vy_tx *tx, struct space *space, struct request *request,
 	struct key_def *def = pk->key_def;
 	assert(def->iid == 0);
 	new_stmt = vy_stmt_new_replace(request->tuple, request->tuple_end,
-				       pk->format, def->part_count);
+				       space->format, def->part_count);
 	if (new_stmt == NULL)
 		return -1;
 	const char *key = tuple_extract_key(new_stmt, def, NULL);
@@ -6214,7 +6213,7 @@ vy_update(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	if (tuple_validate_raw(space->format, new_tuple))
 		return -1;
 	stmt->new_tuple =
-		vy_stmt_new_replace(new_tuple, new_tuple_end, pk->format,
+		vy_stmt_new_replace(new_tuple, new_tuple_end, space->format,
 				    pk->key_def->part_count);
 	if (stmt->new_tuple == NULL)
 		return -1;
@@ -6297,7 +6296,7 @@ vy_index_upsert(struct vy_tx *tx, struct vy_index *index,
 	struct iovec operations[1];
 	operations[0].iov_base = (void *)expr;
 	operations[0].iov_len = expr_end - expr;
-	vystmt = vy_stmt_new_upsert(tuple, tuple_end, index->format,
+	vystmt = vy_stmt_new_upsert(tuple, tuple_end, index->space->format,
 				    index->key_def->part_count, operations, 1);
 	if (vystmt == NULL)
 		return -1;
@@ -6366,7 +6365,7 @@ vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	 */
 	if (old_stmt == NULL) {
 		stmt->new_tuple =
-			vy_stmt_new_replace(tuple, tuple_end, pk->format,
+			vy_stmt_new_replace(tuple, tuple_end, space->format,
 					    pk_def->part_count);
 		if (stmt->new_tuple == NULL)
 			return -1;
@@ -6394,7 +6393,7 @@ vy_upsert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	new_tuple_end = new_tuple + new_size;
 	stmt->old_tuple = old_stmt;
 	stmt->new_tuple =
-		vy_stmt_new_replace(new_tuple, new_tuple_end, pk->format,
+		vy_stmt_new_replace(new_tuple, new_tuple_end, space->format,
 				    pk->key_def->part_count);
 	if (stmt->new_tuple == NULL)
 		return -1;
@@ -6456,7 +6455,7 @@ vy_insert(struct vy_tx *tx, struct txn_stmt *stmt, struct space *space,
 	/* First insert into the primary index. */
 	stmt->new_tuple =
 		vy_stmt_new_replace(request->tuple, request->tuple_end,
-				    pk->format, def->part_count);
+				    space->format, def->part_count);
 	if (stmt->new_tuple == NULL)
 		return -1;
 	if (vy_insert_primary(tx, pk, stmt->new_tuple) != 0)
@@ -7417,7 +7416,7 @@ vy_run_iterator_search_in_page(struct vy_run_iterator *itr,
 	while (beg != end) {
 		uint32_t mid = beg + (end - beg) / 2;
 		struct tuple *fnd_key = vy_page_stmt(page, mid, idx->format,
-						       idx->key_def);
+						     idx->key_def);
 		if (fnd_key == NULL)
 			return end;
 		int cmp = vy_stmt_compare(fnd_key, key, idx->key_def);
@@ -8682,9 +8681,11 @@ vy_merge_iterator_squash_upsert(struct vy_merge_iterator *itr,
 	*ret = NULL;
 	struct tuple *t = itr->curr_stmt;
 	struct key_def *def = itr->index->key_def;
-	struct tuple_format *format = itr->index->format;
 	if (t == NULL)
 		return 0;
+	struct tuple_format *format = itr->index->space->format;
+	/* Upserts enabled only in the primary index. */
+	assert(vy_stmt_type(t) != IPROTO_UPSERT || def->iid == 0);
 	tuple_ref(t);
 	while (vy_stmt_type(t) == IPROTO_UPSERT) {
 		struct tuple *next;
@@ -8861,7 +8862,7 @@ vy_write_iterator_open(struct vy_write_iterator *wi, struct vy_index *index,
 	wi->oldest_vlsn = oldest_vlsn;
 	wi->is_last_level = is_last_level;
 	wi->goto_next_key = false;
-	wi->key = vy_stmt_new_select(index->format, NULL, 0);
+	wi->key = vy_stmt_new_select(index->space->format, NULL, 0);
 	vy_merge_iterator_open(&wi->mi, index, ITER_GE, wi->key);
 }
 
@@ -8936,7 +8937,7 @@ vy_write_iterator_next(struct vy_write_iterator *wi, struct tuple **ret)
 	struct vy_merge_iterator *mi = &wi->mi;
 	struct tuple *stmt = NULL;
 	struct key_def *def = wi->index->key_def;
-	struct tuple_format *format = wi->index->format;
+	struct tuple_format *format = wi->index->space->format;
 	/* @sa vy_write_iterator declaration for the algorithm description. */
 	while (true) {
 		if (wi->goto_next_key) {
@@ -9253,7 +9254,7 @@ vy_read_iterator_next(struct vy_read_iterator *itr, struct tuple **result)
 	struct tuple *t = NULL;
 	struct vy_merge_iterator *mi = &itr->merge_iterator;
 	struct key_def *def = itr->index->key_def;
-	struct tuple_format *format = itr->index->format;
+	struct tuple_format *format = itr->index->space->format;
 	int rc = 0;
 	while (true) {
 		if (vy_read_iterator_merge_next_key(itr, &t)) {
@@ -9354,7 +9355,7 @@ vy_index_send(struct vy_index *index, vy_send_row_f sendrow, void *ctx)
 
 	struct vy_read_iterator ri;
 	struct tuple *stmt;
-	struct tuple *key = vy_stmt_new_select(index->format, NULL, 0);
+	struct tuple *key = vy_stmt_new_select(index->space->format, NULL, 0);
 	if (key == NULL)
 		return -1;
 	vy_read_iterator_open(&ri, index, NULL, ITER_GT, key, &vlsn, true);
@@ -9428,8 +9429,10 @@ vy_squash_process(struct vy_squash *squash)
 {
 	struct vy_index *index = squash->index;
 	struct vy_env *env = index->env;
-	struct tuple_format *format = index->format;
+	struct tuple_format *format = index->space->format;
 	struct key_def *key_def = index->key_def;
+	/* Upserts enabled only in the primary index. */
+	assert(key_def->iid == 0);
 
 	struct vy_read_iterator itr;
 	const int64_t lsn = INT64_MAX;
@@ -9590,7 +9593,7 @@ vy_cursor_new(struct vy_tx *tx, struct vy_index *index, const char *key,
 		return NULL;
 	}
 	assert(part_count <= index->key_def->part_count);
-	c->key = vy_stmt_new_select(index->format, key, part_count);
+	c->key = vy_stmt_new_select(index->space->format, key, part_count);
 	if (c->key == NULL) {
 		mempool_free(&e->cursor_pool, c);
 		return NULL;

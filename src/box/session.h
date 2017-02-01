@@ -79,6 +79,7 @@ struct session {
 	struct credentials credentials;
 	/** Trigger for fiber on_stop to cleanup created on-demand session */
 	struct trigger fiber_on_stop;
+	struct mh_i64ptr_t *transactions;
 };
 
 /**

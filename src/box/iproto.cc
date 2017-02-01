@@ -58,6 +58,8 @@
 #include "cluster.h" /* server_uuid */
 #include "iproto_constants.h"
 #include "rmean.h"
+#include "assoc.h"
+#include "txn.h"
 
 /* The number of iproto messages in flight */
 enum { IPROTO_MSG_MAX = 768 };
@@ -298,6 +300,8 @@ tx_process_misc(struct cmsg *msg);
 static void
 tx_process1(struct cmsg *msg);
 static void
+tx_process_remote_transaction(struct cmsg *msg);
+static void
 tx_process_select(struct cmsg *msg);
 static void
 net_send_msg(struct cmsg *msg);
@@ -364,6 +368,21 @@ static const struct cmsg_hop process1_route[] = {
 	{ net_send_msg, NULL },
 };
 
+static const struct cmsg_hop begin_route[] = {
+	{ tx_process_remote_transaction, &net_pipe },
+	{ net_send_msg, NULL },
+};
+
+static const struct cmsg_hop commit_route[] = {
+	{ tx_process_remote_transaction, &net_pipe },
+	{ net_send_msg, NULL },
+};
+
+static const struct cmsg_hop rollback_route[] = {
+	{ tx_process_remote_transaction, &net_pipe },
+	{ net_send_msg, NULL },
+};
+
 static const struct cmsg_hop *dml_route[IPROTO_TYPE_STAT_MAX] = {
 	NULL,                                   /* IPROTO_OK */
 	select_route,                           /* IPROTO_SELECT */
@@ -375,7 +394,10 @@ static const struct cmsg_hop *dml_route[IPROTO_TYPE_STAT_MAX] = {
 	misc_route,                             /* IPROTO_AUTH */
 	misc_route,                             /* IPROTO_EVAL */
 	process1_route,                         /* IPROTO_UPSERT */
-	misc_route                              /* IPROTO_CALL */
+	misc_route,                             /* IPROTO_CALL */
+	begin_route,                            /* IPROTO_BEGIN */
+	commit_route,                           /* IPROTO_COMMIT */
+	rollback_route                          /* IPROTO_ROLLBACK */
 };
 
 static const struct cmsg_hop sync_route[] = {
@@ -587,6 +609,11 @@ iproto_decode_msg(struct iproto_msg *msg, const char **pos, const char *reqend,
 	case IPROTO_SUBSCRIBE:
 		cmsg_init(msg, sync_route);
 		*stop_input = true;
+		break;
+	case IPROTO_BEGIN:
+	case IPROTO_COMMIT:
+	case IPROTO_ROLLBACK:
+		cmsg_init(msg, dml_route[msg->header.type]);
 		break;
 	default:
 		tnt_raise(ClientError, ER_UNKNOWN_REQUEST_TYPE,
@@ -882,6 +909,50 @@ tx_process1(struct cmsg *m)
 			    tuple != 0);
 	msg->write_end = obuf_create_svp(out);
 	return;
+error:
+	iproto_reply_error(out, diag_last_error(&fiber()->diag),
+			   msg->header.sync);
+	msg->write_end = obuf_create_svp(out);
+}
+
+static void
+tx_process_remote_transaction(struct cmsg *m)
+{
+	struct iproto_msg *msg = (struct iproto_msg *) m;
+	struct obuf *out = &msg->iobuf->out;
+	struct session *session = msg->connection->session;
+	mh_int_t existing_tx;
+	uint32_t tx_id;
+
+	tx_fiber_init(session, msg->header.sync);
+	if (tx_check_schema(msg->header.schema_id))
+		goto error;
+	tx_id = msg->request.header->tx_id;
+
+	existing_tx = mh_i64ptr_find(session->transactions, tx_id, NULL);
+
+	if (msg->request.type == IPROTO_BEGIN) {
+		if (existing_tx != mh_end(session->transactions)) {
+			diag_set(ClientError, ER_ACTIVE_TRANSACTION);
+			goto error;
+		}
+		if (box_txn_begin() != 0)
+			goto error;
+		struct txn *txn = in_txn();
+		assert(txn != NULL);
+		fiber_set_key(fiber(), FIBER_KEY_TXN, NULL);
+		const struct mh_i64ptr_node_t node = { tx_id, txn };
+		mh_int_t rc = mh_i64ptr_put(session->transactions, &node, NULL,
+					    NULL);
+		if (rc == mh_end(session->transactions)) {
+			diag_set(OutOfMemory, (ssize_t) rc, "malloc", "node");
+			goto error;
+		}
+		iproto_reply_ok(out, msg->header.sync);
+		msg->write_end = obuf_create_svp(out);
+		return;
+	}
+	unreachable();
 error:
 	iproto_reply_error(out, diag_last_error(&fiber()->diag),
 			   msg->header.sync);

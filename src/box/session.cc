@@ -78,6 +78,7 @@ session_create(int fd)
 	session->id = sid_max();
 	session->fd =  fd;
 	session->sync = 0;
+	session->transactions = mh_i64ptr_new();
 	/* For on_connect triggers. */
 	credentials_init(&session->credentials, guest_user);
 	if (fd >= 0)
@@ -154,6 +155,7 @@ session_destroy(struct session *session)
 {
 	struct mh_i32ptr_node_t node = { session->id, NULL };
 	mh_i32ptr_remove(session_registry, &node, NULL);
+	mh_i64ptr_delete(session->transactions);
 	mempool_free(&session_pool, session);
 }
 

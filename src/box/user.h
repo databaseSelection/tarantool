@@ -34,6 +34,7 @@
 #include "user_def.h"
 #include "small/region.h"
 
+
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
@@ -101,9 +102,6 @@ user_find_by_name(const char *name, uint32_t len);
 struct user *
 user_find(uint32_t uid);
 
-#if defined(__cplusplus)
-} /* extern "C" */
-
 /**
  * For best performance, all users are maintained in this array.
  * Position in the array is store in user->auth_token and also
@@ -139,6 +137,50 @@ user_cache_replace(struct user_def *user);
 void
 user_cache_delete(uint32_t uid);
 
+/** Initialize the user cache and access control subsystem. */
+void
+user_cache_init();
+
+/** Cleanup the user cache and access control subsystem */
+void
+user_cache_free();
+
+/* {{{ Roles */
+
+/**
+ * Check, mainly, that users & roles form an acyclic graph,
+ * and no loop in the graph will occur when grantee gets
+ * a given role.
+ */
+int
+role_check(struct user *grantee, struct user *role);
+
+/**
+ * Grant a role to a user or another role.
+ */
+int
+role_grant(struct user *grantee, struct user *role);
+
+/**
+ * Revoke a role from a user or another role.
+ */
+int
+role_revoke(struct user *grantee, struct user *role);
+
+/**
+ * Grant or revoke a single privilege to a user or role
+ * and re-evaluate effective access of all users of this
+ * role if this role.
+ */
+int
+priv_grant(struct user *grantee, struct priv_def *priv);
+
+void
+priv_def_create_from_tuple(struct priv_def *priv, struct tuple *tuple);
+
+#if defined(__cplusplus)
+} /* extern "C" */
+
 /* Find a user by name. Used by authentication. */
 static inline struct user *
 user_find_xc(uint32_t uid)
@@ -157,47 +199,6 @@ user_find_by_name_xc(const char *name, uint32_t len)
 		diag_raise();
 	return user;
 }
-
-/** Initialize the user cache and access control subsystem. */
-void
-user_cache_init();
-
-/** Cleanup the user cache and access control subsystem */
-void
-user_cache_free();
-
-/* {{{ Roles */
-
-/**
- * Check, mainly, that users & roles form an acyclic graph,
- * and no loop in the graph will occur when grantee gets
- * a given role.
- */
-void
-role_check(struct user *grantee, struct user *role);
-
-/**
- * Grant a role to a user or another role.
- */
-void
-role_grant(struct user *grantee, struct user *role);
-
-/**
- * Revoke a role from a user or another role.
- */
-void
-role_revoke(struct user *grantee, struct user *role);
-
-/**
- * Grant or revoke a single privilege to a user or role
- * and re-evaluate effective access of all users of this
- * role if this role.
- */
-void
-priv_grant(struct user *grantee, struct priv_def *priv);
-
-void
-priv_def_create_from_tuple(struct priv_def *priv, struct tuple *tuple);
 
 /* }}} */
 

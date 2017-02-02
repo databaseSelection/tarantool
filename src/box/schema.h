@@ -65,7 +65,40 @@ enum {
 };
 /** \endcond public */
 
+extern uint32_t sc_version;
+
+struct space;
+struct func;
+
 #if defined(__cplusplus)
+extern "C" {
+#endif
+
+/**
+ * Try to look up a space by space number in the space cache.
+ * FFI-friendly no-exception-thrown space lookup function.
+ *
+ * @return NULL if space not found, otherwise space object.
+ */
+struct space *
+space_by_id(uint32_t id);
+
+/** No-throw conversion of space id to space name */
+const char *
+space_name_by_id(uint32_t id);
+
+struct func *
+func_by_id(uint32_t fid);
+
+/*
+ * Find object id by object name.
+ */
+int
+schema_find_id(uint32_t system_space_id, uint32_t index_id,
+	       const char *name, uint32_t len, uint32_t *out_id);
+
+#if defined(__cplusplus)
+} /* extern "C" */
 
 #include "error.h"
 #include <stdio.h> /* snprintf */
@@ -77,26 +110,9 @@ enum {
  */
 extern struct latch schema_lock;
 
-extern uint32_t sc_version;
-
-struct space;
-
 /** Call a visitor function on every space in the space cache. */
 void
 space_foreach(void (*func)(struct space *sp, void *udata), void *udata);
-
-/**
- * Try to look up a space by space number in the space cache.
- * FFI-friendly no-exception-thrown space lookup function.
- *
- * @return NULL if space not found, otherwise space object.
- */
-extern "C" struct space *
-space_by_id(uint32_t id);
-
-/** No-throw conversion of space id to space name */
-extern "C" const char *
-space_name_by_id(uint32_t id);
 
 static inline struct space *
 space_cache_find(uint32_t id)
@@ -137,23 +153,12 @@ schema_free();
 
 struct space *schema_space(uint32_t id);
 
-/*
- * Find object id by object name.
- */
-uint32_t
-schema_find_id(uint32_t system_space_id, uint32_t index_id,
-	       const char *name, uint32_t len);
 
 void
 func_cache_replace(struct func_def *def);
 
 void
 func_cache_delete(uint32_t fid);
-
-struct func;
-
-struct func *
-func_by_id(uint32_t fid);
 
 static inline struct func *
 func_cache_find(uint32_t fid)

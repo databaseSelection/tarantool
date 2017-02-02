@@ -63,7 +63,7 @@ add_library(box STATIC
     txn.cc
     box.cc
     user_def.c
-    user.cc
+    user.c
     authentication.cc
     vclock.c
     cluster.cc

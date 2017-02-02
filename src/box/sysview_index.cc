@@ -146,7 +146,7 @@ SysviewIndex::findByKey(const char *key, uint32_t part_count) const
 static bool
 vspace_filter(struct space *source, struct tuple *tuple)
 {
-	struct credentials *cr = current_user();
+	struct credentials *cr = current_user_xc();
 	if (PRIV_R & cr->universal_access)
 		return true; /* read access to unverse */
 	if (PRIV_R & source->access[cr->auth_token].effective)
@@ -172,7 +172,7 @@ SysviewVindexIndex::SysviewVindexIndex(struct key_def *key_def)
 static bool
 vuser_filter(struct space *source, struct tuple *tuple)
 {
-	struct credentials *cr = current_user();
+	struct credentials *cr = current_user_xc();
 	if (PRIV_R & cr->universal_access)
 		return true; /* read access to unverse */
 	if (PRIV_R & source->access[cr->auth_token].effective)
@@ -191,7 +191,7 @@ SysviewVuserIndex::SysviewVuserIndex(struct key_def *key_def)
 static bool
 vpriv_filter(struct space *source, struct tuple *tuple)
 {
-	struct credentials *cr = current_user();
+	struct credentials *cr = current_user_xc();
 	if (PRIV_R & cr->universal_access)
 		return true; /* read access to unverse */
 	if (PRIV_R & source->access[cr->auth_token].effective)
@@ -210,7 +210,7 @@ SysviewVprivIndex::SysviewVprivIndex(struct key_def *key_def)
 static bool
 vfunc_filter(struct space *source, struct tuple *tuple)
 {
-	struct credentials *cr = current_user();
+	struct credentials *cr = current_user_xc();
 	if ((PRIV_R | PRIV_X) & cr->universal_access)
 		return true; /* read or execute access to unverse */
 	if (PRIV_R & source->access[cr->auth_token].effective)

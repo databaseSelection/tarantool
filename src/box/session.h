@@ -156,9 +156,6 @@ extern struct rlist session_on_disconnect;
 void
 session_storage_cleanup(int sid);
 
-#if defined(__cplusplus)
-} /* extern "C" */
-
 /**
  * Create a session.
  * Invokes a Lua trigger box.session.on_connect if it is
@@ -185,6 +182,40 @@ session_create(int fd);
 void
 session_destroy(struct session *);
 
+/*
+ * Return the current user. Create it if it doesn't
+ * exist yet.
+ * The same rationale for initializing the current
+ * user on demand as in current_session() applies.
+ */
+static inline struct credentials *
+current_user()
+{
+	struct credentials *u =
+		(struct credentials *) fiber_get_key(fiber(), FIBER_KEY_USER);
+	if (u == NULL) {
+		if (session_create_on_demand() == NULL)
+			return NULL;
+		u = (struct credentials *) fiber_get_key(fiber(),
+							  FIBER_KEY_USER);
+	}
+	return u;
+}
+
+#if defined(__cplusplus)
+} /* extern "C" */
+
+static inline struct credentials *
+current_user_xc()
+{
+	struct credentials *cr = current_user();
+	if (cr == NULL) {
+		diag_raise();
+	}
+	return cr;
+
+}
+
 /** Run on-connect triggers */
 void
 session_run_on_connect_triggers(struct session *session);
@@ -196,37 +227,18 @@ session_run_on_disconnect_triggers(struct session *session);
 void
 session_run_on_auth_triggers(const char *user_name);
 
-/*
- * Return the current user. Create it if it doesn't
- * exist yet.
- * The same rationale for initializing the current
- * user on demand as in current_session() applies.
- */
-static inline struct credentials *
-current_user()
-{
-	struct credentials *u =
-		(struct credentials *) fiber_get_key(fiber(),
-						      FIBER_KEY_USER);
-	if (u == NULL) {
-		session_create_on_demand();
-		u = (struct credentials *) fiber_get_key(fiber(),
-							  FIBER_KEY_USER);
-	}
-	return u;
-}
 
 static inline void
 access_check_universe(uint8_t access)
 {
-	struct credentials *credentials = current_user();
-	if (!(credentials->universal_access & access)) {
+	struct credentials *cr = current_user_xc();
+	if (!(cr->universal_access & access)) {
 		/*
 		 * Access violation, report error.
 		 * The user may not exist already, if deleted
 		 * from a different connection.
 		 */
-		struct user *user = user_find_xc(credentials->uid);
+		struct user *user = user_find_xc(cr->uid);
 		tnt_raise(ClientError, ER_ACCESS_DENIED,
 			  priv_name(access), schema_object_name(SC_UNIVERSE),
 			  user->def.name);

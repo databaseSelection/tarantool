@@ -28,6 +28,7 @@
  * THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
+#include <stdint.h>
 #include "schema.h"
 #include "user_def.h"
 #include "engine.h"
@@ -74,7 +75,7 @@ space_is_system(struct space *space)
 }
 
 /** Return space by its number */
-extern "C" struct space *
+struct space *
 space_by_id(uint32_t id)
 {
 	mh_int_t space = mh_i32ptr_find(spaces, id, NULL);
@@ -83,7 +84,7 @@ space_by_id(uint32_t id)
 	return (struct space *) mh_i32ptr_node(spaces, space)->val;
 }
 
-extern "C" const char *
+const char *
 space_name_by_id(uint32_t id)
 {
 	struct space *space = space_by_id(id);
@@ -199,31 +200,54 @@ sc_space_new(struct space_def *space_def,
 	return space;
 }
 
-uint32_t
+int
 schema_find_id(uint32_t system_space_id, uint32_t index_id,
-	       const char *name, uint32_t len)
+	       const char *name, uint32_t len, uint32_t *out_id)
 {
-	struct space *space = space_cache_find(system_space_id);
-	MemtxIndex *index = index_find_system(space, index_id);
-	char buf[BOX_NAME_MAX * 2];
+	*out_id = BOX_ID_NIL;
+	char key[BOX_NAME_MAX * 2 + 1], *key_end;
 	/**
 	 * This is an internal-only method, we should know the
 	 * max length in advance.
 	 */
-	if (len + 5 > sizeof(buf))
-		return BOX_ID_NIL;
+	if (len + 5 > sizeof(key))
+		return 0;
+	key_end = mp_encode_array(key, 1);
+	key_end = mp_encode_str(key_end, name, len);
 
-	mp_encode_str(buf, name, len);
+	box_iterator_t *it = box_index_iterator(system_space_id, index_id,
+						ITER_EQ, key, key_end);
+	if (it == NULL)
+		return -1;
 
-	struct iterator *it = index->position();
-	index->initIterator(it, ITER_EQ, buf, 1);
+	struct tuple *tuple = NULL;
 
-	struct tuple *tuple = it->next(it);
+	if (box_iterator_next(it, &tuple) == -1)
+		return -1;
+
 	if (tuple) {
 		/* id is always field #1 */
-		return tuple_field_u32_xc(tuple, 0);
+		const char *field = tuple_field(tuple, 0);
+		if (field == NULL) {
+			diag_set(ClientError, ER_NO_SUCH_FIELD, 0);
+			return -1;
+		}
+		if (mp_typeof(*field) != MP_UINT) {
+			diag_set(ClientError, ER_FIELD_TYPE,
+				 0 + TUPLE_INDEX_BASE,
+				 mp_type_strs[MP_UINT]);
+			return -1;
+		}
+		uint64_t id = mp_decode_uint(&field);
+		if (id > UINT32_MAX) {
+			diag_set(ClientError, ER_FIELD_TYPE,
+				 0 + TUPLE_INDEX_BASE,
+				 field_type_strs[FIELD_TYPE_UNSIGNED]);
+			return -1;
+		}
+		*out_id = (uint32_t )id;
 	}
-	return BOX_ID_NIL;
+	return 0;
 }
 
 /**

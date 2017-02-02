@@ -136,9 +136,8 @@ fiber_pool_destroy(struct fiber_pool *pool)
 	 * and fibers are freed at once when thread runtime
 	 * pool is destroyed.
          */
-	/*
-	 * cbus leaving is not implemented yet
-	 */
+	while (cbus_leave(&pool->endpoint) > 0)
+		fiber_sleep(0.01);
 }
 
 /** }}} fiber_pool */

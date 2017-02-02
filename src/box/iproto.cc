@@ -1194,6 +1194,7 @@ net_cord_f(va_list /* ap */)
 		}
 		fiber_yield();
 	}
+	cpipe_destroy(&tx_pipe);
 	/*
 	 * Nothing to do in the fiber so far, the service
 	 * will take care of creating events for incoming
